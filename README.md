@@ -16,6 +16,10 @@ The first time, a Chrome window opens. Log in and tick **Remember me**, and the 
 ./install_browser.sh --uninstall
 ```
 
+## Change how much it pokes
+
+Open `settings.ini` to set how many pokes and friend requests it sends per day, how many minutes it waits between pokes, and whether friends go first. Then run `./install_browser.sh` to apply your changes.
+
 ## See what it's doing
 
 ```

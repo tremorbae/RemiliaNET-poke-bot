@@ -1,6 +1,6 @@
 #!/bin/bash
-# Installs poke_browser.py as two launchd jobs: one that checks every minute and pokes someone every 1 to 5 minutes, and an
-# always-on --watch-feed listener that notes who shows up in the activity feed. --uninstall removes both.
+# Installs poke_browser.py as two always-on launchd jobs: the poker, which times its own pokes as set in settings.ini,
+# and a --watch-feed listener that notes who shows up in the activity feed. --uninstall removes both.
 # Sets up Playwright in its own Python environment and, the first time, opens Chrome for you to sign in.
 #
 # Everything lives in ~/Library/Application Support because macOS blocks
@@ -13,14 +13,13 @@ APP_DIR="$HOME/Library/Application Support/remilianet-poke-browser"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 FEED_PLIST="$HOME/Library/LaunchAgents/$FEED_LABEL.plist"
 LOG="$HOME/Library/Logs/remilianet-poke-browser.log"
-INTERVAL=60  # keep in sync with CHECK_INTERVAL in poke_browser.py
 PLAYWRIGHT_VERSION=1.60.0  # the last release that runs on macOS's built-in Python 3.9
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootout "gui/$(id -u)/$FEED_LABEL" 2>/dev/null || true
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-  rm -f "$PLIST" "$FEED_PLIST" "$APP_DIR/poke_browser.py"
+  rm -f "$PLIST" "$FEED_PLIST" "$APP_DIR/poke_browser.py" "$APP_DIR/settings.ini"
   rm -rf "$APP_DIR/venv"
   echo "Uninstalled. Your sign-in, browser profile and poke history are still in $APP_DIR (delete the folder to remove them)."
   exit 0
@@ -38,12 +37,13 @@ if [[ ! -x "$APP_DIR/venv/bin/python" ]]; then
 fi
 "$APP_DIR/venv/bin/pip" install --quiet --disable-pip-version-check "playwright==$PLAYWRIGHT_VERSION"
 cp "$(dirname "$0")/poke_browser.py" "$APP_DIR/poke_browser.py"
+cp "$(dirname "$0")/settings.ini" "$APP_DIR/settings.ini"
 
 if [[ ! -f "$APP_DIR/cookies.json" ]]; then
   "$APP_DIR/venv/bin/python" "$APP_DIR/poke_browser.py" --login
 fi
 
-# write_plist PATH LABEL FLAG WHEN_KEY WHEN_VALUE: a job running poke_browser.py FLAG, started per WHEN_KEY.
+# write_plist PATH LABEL FLAG: an always-on job running poke_browser.py FLAG.
 write_plist() {
   cat > "$1" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -58,8 +58,8 @@ write_plist() {
     <string>$APP_DIR/poke_browser.py</string>
     <string>$3</string>
   </array>
-  <key>$4</key>
-  $5
+  <key>KeepAlive</key>
+  <true/>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
@@ -72,9 +72,9 @@ EOF
 }
 
 mkdir -p "$HOME/Library/LaunchAgents"
-write_plist "$FEED_PLIST" "$FEED_LABEL" --watch-feed KeepAlive "<true/>"
-write_plist "$PLIST" "$LABEL" --scheduled StartInterval "<integer>$INTERVAL</integer>"
+write_plist "$FEED_PLIST" "$FEED_LABEL" --watch-feed
+write_plist "$PLIST" "$LABEL" --scheduled
 
 launchctl bootstrap "gui/$(id -u)" "$FEED_PLIST"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "Installed. Pokes one person now and then every 1 to 5 minutes, friends first; the feed listener stays on. Log: $LOG"
+echo "Installed. Pokes one person at a time, friends first, as set in settings.ini; the feed listener stays on. Log: $LOG"

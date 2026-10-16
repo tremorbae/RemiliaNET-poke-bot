@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Poke one RemiliaNET user every 1 to 5 minutes, around the clock, without an API key: friends whose
-24h cooldown is up first, then everyone else it can find. After poking someone who isn't a friend it sends
+"""Poke one RemiliaNET user every few minutes, around the clock, without an API key: friends whose
+24h cooldown is up first, then everyone else it can find. How often, and how many per day, is set in settings.ini. After poking someone who isn't a friend it sends
 them a friend request (or accepts theirs), and never asks anyone who declined again. Also views the profile
 of everyone else who shows up in the activity feed (the site notifies them).
 
 Drives a headless Google Chrome (through Playwright) that is signed in to
-remilia.net in its own profile, separate from your everyday Chrome. launchd starts
-this every minute; a check that lands on the next poke slot opens the page, pokes
-one person and views whoever the feed has shown, with the same requests the website
-makes, and closes it. Opening the page that often also keeps the website's sign-in
-fresh. Runs next to an always-on --watch-feed listener (see install_browser.sh).
+remilia.net in its own profile, separate from your everyday Chrome. launchd keeps it
+running; it times each poke itself, keeping the page open while the next poke is near,
+and views whoever the feed has shown in between, with the same requests the website
+makes. Having the page open regularly also keeps the website's sign-in fresh. Runs
+next to an always-on --watch-feed listener (see install_browser.sh).
 
     python3 poke_browser.py --login       one-time: sign in in a Chrome window (tick "Remember me")
     python3 poke_browser.py --dry-run     show who is due a poke or a view, without doing either
@@ -17,6 +17,7 @@ fresh. Runs next to an always-on --watch-feed listener (see install_browser.sh).
     python3 poke_browser.py --watch-feed  record everyone in the activity feed (runs forever)
 """
 import argparse
+import configparser
 import json
 import os
 import random
@@ -40,6 +41,7 @@ COOKIES_FILE = APP_DIR / "cookies.json"
 STATE_FILE = APP_DIR / "state.json"
 FEED_FILE = APP_DIR / "feed.json"  # written only by --watch-feed
 EVERYONE_FILE = APP_DIR / "everyone.json"  # everyone discovered so far, and who has been crawled
+SETTINGS_FILE = APP_DIR / "settings.ini"  # copied from the project folder by install_browser.sh
 
 try:
     from playwright.sync_api import Error as PlaywrightError, sync_playwright
@@ -49,7 +51,11 @@ except ImportError:
         os.execv(VENV_PYTHON, [str(VENV_PYTHON), *sys.argv])
     sys.exit("Playwright isn't installed yet. Run ./install_browser.sh first.")
 
-CHECK_INTERVAL = 60  # keep in sync with StartInterval in install_browser.sh
+# The scheduled bot runs all the time and times each poke itself (launchd just keeps it running).
+OPEN_CHROME_AHEAD = 30  # start Chrome this long before a poke is due
+CLOSE_CHROME_ABOVE = 3 * 60  # close Chrome while the next poke is further away than this
+CHROME_SESSION = 15 * 60  # restart Chrome this often, so it stays fresh
+ERROR_RETRY = 60
 COOLDOWN = 24 * 3600
 FRIENDS_REFRESH = 6 * 3600  # re-fetch the friend list at least this often, to pick up new friends
 FAILED_RETRY = 6 * 3600
@@ -63,7 +69,8 @@ VIEW_EVERY = 24 * 3600  # view someone at most this often, and only if the feed 
 FEED_IDLE_TIMEOUT = 300  # reconnect if the feed sends nothing for this long
 FEED_RECONNECT = 10
 # One poke at a time, around the clock: friends whose cooldown is up first, then everyone else.
-POKE_GAP = (60, 300)  # seconds from one poke to the next, picked at random each time
+# How many pokes and friend requests, and how far apart, come from settings.ini (see load_settings).
+LIMIT_REST = 15 * 60  # with today's poke limit reached, still open the page this often to keep the sign-in fresh
 MAX_TRIES_PER_SLOT = 5  # people found to be on cooldown don't use up a slot; try this many in a row at most
 DISCOVER_BELOW = 50  # look for more people when fewer than this many non-friends are due
 CRAWL_PAGES_PER_RUN = 20  # friend-list pages read per look, to find more people
@@ -117,6 +124,46 @@ def write_json(path, data):
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(data, f, indent=1, sort_keys=True)
     os.replace(tmp, path)
+
+
+def load_settings():
+    """Reads settings.ini. Anything missing falls back to the default; anything unreadable too, with a note in the log."""
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(SETTINGS_FILE)
+    except configparser.Error as e:
+        log(f"settings.ini couldn't be read ({e}); using the defaults.")
+        parser = configparser.ConfigParser()
+
+    def number(section, key, default, lowest):
+        try:
+            value = parser.getfloat(section, key, fallback=default)
+        except ValueError:
+            log(f"settings.ini: [{section}] {key} isn't a number; using {default}.")
+            value = default
+        return max(value, lowest)
+
+    try:
+        friends_first = parser.getboolean("pokes", "friends_first", fallback=True)
+    except ValueError:
+        log("settings.ini: [pokes] friends_first should be yes or no; using yes.")
+        friends_first = True
+
+    shortest, longest = sorted((number("pokes", "min_minutes_between", 1, 1), number("pokes", "max_minutes_between", 5, 1)))
+    return {
+        "pokes_per_day": int(number("pokes", "per_day", 500, 0)),
+        "friends_first": friends_first,
+        "friend_requests_per_day": int(number("friend requests", "per_day", 500, 0)),
+        "gap": (shortest * 60, longest * 60),
+    }
+
+
+def today(state):
+    """Today's poke and friend-request counts, which start again from zero at midnight."""
+    day = datetime.now().strftime("%Y-%m-%d")
+    if state.get("today", {}).get("day") != day:
+        state["today"] = {"day": day, "pokes": 0, "friend_requests": 0}
+    return state["today"]
 
 
 class Site:
@@ -278,8 +325,10 @@ def befriend(site, handle, state):
     return f"friend request failed (HTTP {status} {json.dumps(body)[:120] if body else ''})"
 
 
-def poke_next(site, state, dry_run):
-    """Pokes one person: the friend whose cooldown ended longest ago, or else someone else who is due."""
+def poke_next(site, state, dry_run, settings):
+    """Pokes one person: the friend whose cooldown ended longest ago, or else someone else who is due
+    (or, with friends_first off, anyone due at random). Does nothing once today's poke limit is reached.
+    Returns when the poke was sent, or None if nobody was poked."""
     handle = site.require_sign_in()
     if state.get("handle") != handle:
         # First run, or signed in as someone else: start a fresh schedule.
@@ -294,6 +343,15 @@ def poke_next(site, state, dry_run):
         state["friends"], state["friends_fetched_at"] = friends, time.time()
     write_json(STATE_FILE, state)
 
+    counts = today(state)
+    poke_limit, request_limit = settings["pokes_per_day"], settings["friend_requests_per_day"]
+    if dry_run:
+        print(f"Today: {counts['pokes']} of {poke_limit} pokes, {counts['friend_requests']} of {request_limit} friend requests.")
+    if counts["pokes"] >= poke_limit:
+        if dry_run:
+            print("Today's poke limit is reached; poking starts again after midnight.")
+        return
+
     def due(people):
         """Who in people can be poked now, longest-waiting first (ties, like never-poked, in random order)."""
         now = time.time()
@@ -305,6 +363,8 @@ def poke_next(site, state, dry_run):
         others = discover(site, state) - not_others
     friends_due, others_due = due(friends), due(others)
     queue = friends_due + others_due
+    if not settings["friends_first"]:
+        random.shuffle(queue)
     if dry_run:
         print(f"~{handle}: {len(friends_due)} of {len(friends)} friends and {len(others_due)} of {len(others)} others due for a poke.")
         if queue:
@@ -312,16 +372,28 @@ def poke_next(site, state, dry_run):
         return
 
     for target in queue[:MAX_TRIES_PER_SLOT]:
+        poked_at = time.time()
         result = poke(site, target, next_poke_at)
         state["failures_in_a_row"] = state.get("failures_in_a_row", 0) + 1 if result == "failed" else 0
         write_json(STATE_FILE, state)
         if result != "cooldown":
             kind = "friend" if target in friends else "other"
-            if result == "poked" and kind == "other":
-                result += "; " + befriend(site, target, state)
+            if result == "poked":
+                counts["pokes"] += 1
+                if kind == "other" and request_limit > 0:
+                    if counts["friend_requests"] >= request_limit:
+                        result += "; today's friend request limit is reached"
+                    else:
+                        outcome = befriend(site, target, state)
+                        counts["friend_requests"] += outcome == "friend request sent"
+                        result += "; " + outcome
                 write_json(STATE_FILE, state)
-            log(f"~{target} ({kind}): {result}. Still due: {len(due(friends))} friends, {len(due(others))} others.")
-            return
+            log(f"~{target} ({kind}): {result}. Today: {counts['pokes']}/{poke_limit} pokes, "
+                f"{counts['friend_requests']}/{request_limit} friend requests. "
+                f"Still due: {len(due(friends))} friends, {len(due(others))} others.")
+            if counts["pokes"] == poke_limit:
+                log(f"Reached today's limit of {poke_limit} pokes; poking starts again after midnight.")
+            return poked_at
         site.wait(DELAY)
 
 
@@ -401,8 +473,9 @@ def view_profile(site, handle):
     return status
 
 
-def view_feed_users(site, state, dry_run):
-    """Views everyone the feed has shown since their last view, newest first; you and your friends are skipped."""
+def view_feed_users(site, state, dry_run, until=None):
+    """Views everyone the feed has shown since their last view, newest first; you and your friends are skipped.
+    Stops at until (a time), so views fill the wait before the next poke without delaying it."""
     seen = read_json(FEED_FILE).get("seen", {})
     viewed_at = state.setdefault("viewed_at", {})
     now = time.time()
@@ -418,6 +491,8 @@ def view_feed_users(site, state, dry_run):
 
     viewed = 0
     for handle in todo:
+        if until is not None and time.time() >= until:
+            break
         status = view_profile(site, handle)
         if status in (200, 404):  # a 404 is a deleted account: nothing to retry
             viewed_at[handle] = time.time()
@@ -429,69 +504,119 @@ def view_feed_users(site, state, dry_run):
             log(f"~{handle}: profile view failed with HTTP {status}")
         write_json(STATE_FILE, state)
         site.wait(DELAY)
-    log(f"Profile views from the activity feed: {viewed}.")
+    if viewed:
+        log(f"Profile views from the activity feed: {viewed}.")
 
 
-def run(args):
+def next_gap(state, settings):
+    """Seconds from one poke to the next: a random wait from settings.ini, or a rest after failures or the daily limit."""
+    if state.get("failures_in_a_row", 0) >= STOP_AFTER_FAILURES:
+        log(f"{state['failures_in_a_row']} failed pokes in a row; resting {FAILURE_REST // 60} minutes.")
+        return FAILURE_REST
+    if today(state)["pokes"] >= settings["pokes_per_day"]:
+        return LIMIT_REST
+    return random.uniform(*settings["gap"])
+
+
+def schedule_next(state, settings, poked_at):
+    state["next_slot_at"] = (poked_at or time.time()) + next_gap(state, settings)
+    write_json(STATE_FILE, state)
+
+
+def pause_for_login(error):
+    """Pauses the bot until --login clears it, with a single notification."""
+    state = read_json(STATE_FILE)
+    if not state.get("needs_login"):
+        state["needs_login"] = True
+        write_json(STATE_FILE, state)
+        notify(f"Paused: {error}. Run: python3 poke_browser.py --login")
+    log(f"Paused: {error}. Run: python3 poke_browser.py --login")
+
+
+def run_once(args):
+    """python3 poke_browser.py [--dry-run]: one poke (or a preview) right now."""
     if not COOKIES_FILE.exists():
         sys.exit("Not signed in yet. Run: python3 poke_browser.py --login")
-    state = read_json(STATE_FILE)
-    if args.scheduled:
-        if state.get("needs_login"):
-            return
-        # launchd checks every minute; only the check that lands on the next poke slot opens Chrome.
-        wait = state.get("next_slot_at", 0) - time.time()
-        if wait > CHECK_INTERVAL:
-            return
-        if wait > 0:
-            time.sleep(wait)
+    state, settings = read_json(STATE_FILE), load_settings()
+    with sync_playwright() as playwright:
+        site = Site(playwright, headless=True)
+        try:
+            poked_at = poke_next(site, state, args.dry_run, settings)
+            if not args.dry_run:
+                schedule_next(state, settings, poked_at)
+            view_feed_users(site, state, args.dry_run)
+            site.save_cookies()
+        finally:
+            site.close()
 
-    try:
-        with sync_playwright() as playwright:
-            site = Site(playwright, headless=True)
-            try:
-                poke_next(site, state, args.dry_run)
-                view_feed_users(site, state, args.dry_run)
+
+def chrome_session(state, settings):
+    """Keeps Chrome open and pokes each time a slot comes up, viewing profiles in between. Returns once the next poke
+    is far off, or (so Chrome gets restarted now and then) right after a poke once it has been open CHROME_SESSION."""
+    with sync_playwright() as playwright:
+        site = Site(playwright, headless=True)
+        try:
+            opened = time.time()
+            while True:
+                wait = state.get("next_slot_at", 0) - time.time()
+                if wait > CLOSE_CHROME_ABOVE:
+                    break
+                if wait > 0:
+                    site.wait(wait)
+                schedule_next(state, settings, poke_next(site, state, False, settings))
                 site.save_cookies()
-            finally:
-                site.close()
-    finally:
-        # Even after an error, so a broken run is retried at the next slot rather than every minute.
-        if not args.dry_run:
-            if state.get("failures_in_a_row", 0) >= STOP_AFTER_FAILURES:
-                log(f"{state['failures_in_a_row']} failed pokes in a row; resting {FAILURE_REST // 60} minutes.")
-                gap = FAILURE_REST
-            else:
-                gap = random.uniform(*POKE_GAP)
-            state["next_slot_at"] = time.time() + gap
+                if time.time() - opened >= CHROME_SESSION:
+                    break  # restart Chrome now, while the next poke is a whole wait away
+                view_feed_users(site, state, False, until=state["next_slot_at"] - 5)
+        finally:
+            site.close()
+
+
+def run_forever():
+    """--scheduled: launchd starts this and keeps it running. It times each poke itself, opening Chrome shortly before
+    a poke is due and keeping it open while the next one is near. Waits quietly while a new sign-in is needed."""
+    while True:
+        state = read_json(STATE_FILE)
+        if state.get("needs_login") or not COOKIES_FILE.exists():
+            time.sleep(60)
+            continue
+        wait = state.get("next_slot_at", 0) - time.time()
+        if wait > OPEN_CHROME_AHEAD:
+            # Short naps, so a Mac waking from sleep catches up straight away.
+            time.sleep(min(wait - OPEN_CHROME_AHEAD, 60))
+            continue
+        try:
+            chrome_session(state, load_settings())
+        except NeedsLogin as e:
+            pause_for_login(e)
+        except (RuntimeError, OSError, PlaywrightError) as e:
+            log(f"Error, retrying in a minute: {e}")
+            state["next_slot_at"] = time.time() + ERROR_RETRY + OPEN_CHROME_AHEAD  # Chrome opens OPEN_CHROME_AHEAD early
             write_json(STATE_FILE, state)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Poke one RemiliaNET user every 1 to 5 minutes (friends first), through a signed-in headless Chrome.")
+    parser = argparse.ArgumentParser(description="Poke one RemiliaNET user every few minutes (friends first, as set in settings.ini), through a signed-in headless Chrome.")
     parser.add_argument("--login", action="store_true", help='sign in in a Chrome window (tick "Remember me")')
     parser.add_argument("--dry-run", action="store_true", help="show who is due a poke or a view, without doing either")
-    parser.add_argument("--scheduled", action="store_true", help="set by launchd; stays quiet while a new sign-in is needed")
+    parser.add_argument("--scheduled", action="store_true", help="set by launchd: runs forever, poking on schedule")
     parser.add_argument("--watch-feed", action="store_true", help="record everyone in the activity feed; runs forever (launchd keeps it up)")
     args = parser.parse_args()
 
     if args.watch_feed:
         watch_feed()
+    if args.scheduled:
+        run_forever()
     try:
         if args.login:
             login()
         else:
-            run(args)
+            run_once(args)
     except NeedsLogin as e:
-        state = read_json(STATE_FILE)
-        if not state.get("needs_login"):
-            state["needs_login"] = True
-            write_json(STATE_FILE, state)
-            notify(f"Paused: {e}. Run: python3 poke_browser.py --login")
-        log(f"Paused: {e}. Run: python3 poke_browser.py --login")
+        pause_for_login(e)
         sys.exit(1)
     except (RuntimeError, OSError, PlaywrightError) as e:
-        log(f"Error: {e}" if args.login else f"Error, will retry next run: {e}")
+        log(f"Error: {e}")
         sys.exit(1)
 
 
